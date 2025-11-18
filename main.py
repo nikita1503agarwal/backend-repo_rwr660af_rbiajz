@@ -1,10 +1,11 @@
 import os
-from datetime import datetime, timedelta
-from typing import List, Optional
+from datetime import datetime, timedelta, time, date
+from typing import List, Optional, Dict, Tuple
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from bson import ObjectId
+from zoneinfo import ZoneInfo
 
 from database import db, create_document, get_documents
 from schemas import Organization, Worker, ServiceType, Appointment, AvailabilityRule, Subscription, Payment
@@ -35,6 +36,159 @@ def with_id(doc):
     return doc
 
 
+ACTIVE_APPT_STATUSES = ["tentative", "confirmed", "deposit_paid", "paid"]
+
+
+def parse_hhmm(s: str) -> time:
+    h, m = s.split(":")
+    return time(int(h), int(m))
+
+
+def get_org_timezone(org_doc) -> ZoneInfo:
+    tz = (org_doc.get("timezone") if isinstance(org_doc, dict) else getattr(org_doc, "timezone", None)) or "UTC"
+    try:
+        return ZoneInfo(tz)
+    except Exception:
+        return ZoneInfo("UTC")
+
+
+def load_availability_rules(organization_id: str) -> List[dict]:
+    return list(db["availabilityrule"].find({"organization_id": organization_id}))
+
+
+def build_daily_work_windows(
+    org: dict,
+    rules: List[dict],
+    service_id: str
+) -> Dict[int, List[Tuple[time, time]]]:
+    """
+    Returns mapping weekday (0=Mon) -> list of (start_time, end_time) windows in local org time.
+    If no work_hours rules exist, defaults to Mon-Fri 09:00-17:00.
+    Respects service-specific rules (service_ids). If any service-specific work_hours rules exist
+    for the given service, use only those for that weekday; otherwise fall back to global rules.
+    """
+    # Separate rules
+    work_rules = [r for r in rules if r.get("rule_type") == "work_hours"]
+    svc_specific = [r for r in work_rules if r.get("service_ids")]  # any with list
+    svc_rules = [r for r in svc_specific if service_id in (r.get("service_ids") or [])]
+
+    result: Dict[int, List[Tuple[time, time]]] = {i: [] for i in range(7)}
+
+    def add_rule_to_result(r):
+        wd = r.get("weekday")
+        if wd is None:
+            return
+        try:
+            st = parse_hhmm(r.get("start"))
+            en = parse_hhmm(r.get("end"))
+            if st < en:
+                result[int(wd)].append((st, en))
+        except Exception:
+            pass
+
+    if svc_rules:
+        for r in svc_rules:
+            add_rule_to_result(r)
+    else:
+        # use global work rules (no service_ids)
+        global_work = [r for r in work_rules if not r.get("service_ids")]
+        if global_work:
+            for r in global_work:
+                add_rule_to_result(r)
+        else:
+            # default Mon-Fri 09:00-17:00
+            for wd in range(0, 5):
+                result[wd].append((time(9, 0), time(17, 0)))
+
+    # Sort windows
+    for wd in result:
+        result[wd].sort()
+    return result
+
+
+def is_blocked_day(dt_local: date, rules: List[dict], service_id: str) -> bool:
+    ds = dt_local.isoformat()  # YYYY-MM-DD
+    weekday = dt_local.weekday()
+
+    # Rule: block_date
+    for r in rules:
+        if r.get("rule_type") == "block_date" and r.get("date") == ds:
+            # if service_ids exists, only block for those services; otherwise global
+            svc_ids = r.get("service_ids")
+            if not svc_ids or service_id in svc_ids:
+                return True
+
+    # Rule: block_weekday
+    for r in rules:
+        if r.get("rule_type") == "block_weekday" and r.get("weekday") == weekday:
+            svc_ids = r.get("service_ids")
+            if not svc_ids or service_id in svc_ids:
+                return True
+
+    return False
+
+
+def existing_conflict(organization_id: str, start_utc: datetime, end_utc: datetime, exclude_appt_id: Optional[ObjectId] = None) -> bool:
+    q = {
+        "organization_id": organization_id,
+        "start_time": {"$lt": end_utc},
+        "end_time": {"$gt": start_utc},
+        "status": {"$in": ACTIVE_APPT_STATUSES}
+    }
+    if exclude_appt_id:
+        q["_id"] = {"$ne": exclude_appt_id}
+    conflict = db["appointment"].find_one(q)
+    return bool(conflict)
+
+
+def generate_slots(
+    organization_id: str,
+    service_id: str,
+    start_date_local: date,
+    days: int,
+) -> List[Dict[str, str]]:
+    org = db["organization"].find_one({"_id": to_object_id(organization_id)})
+    if not org:
+        raise HTTPException(status_code=404, detail="Organization not found")
+    svc = db["servicetype"].find_one({"_id": to_object_id(service_id)})
+    if not svc:
+        raise HTTPException(status_code=404, detail="Service not found")
+
+    tz = get_org_timezone(org)
+    duration = int(svc.get("duration_minutes", 60))
+    rules = load_availability_rules(organization_id)
+    windows_by_wd = build_daily_work_windows(org, rules, service_id)
+
+    out: List[Dict[str, str]] = []
+
+    for d in range(days):
+        day_local = start_date_local + timedelta(days=d)
+        weekday = day_local.weekday()
+        if is_blocked_day(day_local, rules, service_id):
+            continue
+        windows = windows_by_wd.get(weekday, [])
+        if not windows:
+            continue
+        for st_t, en_t in windows:
+            # iterate over the window in duration increments
+            # Localize to org tz and then convert to UTC for conflict checks/return
+            cur_local_dt = datetime.combine(day_local, st_t)
+            end_window_local_dt = datetime.combine(day_local, en_t)
+            while cur_local_dt + timedelta(minutes=duration) <= end_window_local_dt:
+                start_local = cur_local_dt.replace(tzinfo=tz)
+                end_local = (cur_local_dt + timedelta(minutes=duration)).replace(tzinfo=tz)
+                start_utc = start_local.astimezone(ZoneInfo("UTC"))
+                end_utc = end_local.astimezone(ZoneInfo("UTC"))
+                if not existing_conflict(organization_id, start_utc, end_utc):
+                    out.append({
+                        "start": start_utc.isoformat(),
+                        "end": end_utc.isoformat(),
+                    })
+                cur_local_dt += timedelta(minutes=duration)
+
+    return out
+
+
 # Public booking link resolution
 @app.get("/public/{slug}")
 def get_public_org(slug: str):
@@ -58,6 +212,17 @@ class CreateAppointmentRequest(BaseModel):
     notes: Optional[str] = None
 
 
+@app.get("/public/slots")
+def public_slots(organization_id: str, service_id: str, date_str: str, days: int = 1):
+    try:
+        start_date_local = datetime.strptime(date_str, "%Y-%m-%d").date()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date format, expected YYYY-MM-DD")
+    days = max(1, min(days, 14))
+    slots = generate_slots(organization_id, service_id, start_date_local, days)
+    return {"slots": slots}
+
+
 @app.post("/public/book")
 def public_book(req: CreateAppointmentRequest):
     # basic validation: org and service exist
@@ -69,17 +234,35 @@ def public_book(req: CreateAppointmentRequest):
         raise HTTPException(status_code=404, detail="Service not found")
 
     duration = int(svc.get("duration_minutes", 60))
-    start = req.start_time
-    end = start + timedelta(minutes=duration)
 
-    # check conflicts for worker-agnostic booking (later assign)
-    conflict = db["appointment"].find_one({
-        "organization_id": req.organization_id,
-        "start_time": {"$lt": end},
-        "end_time": {"$gt": start},
-        "status": {"$in": ["tentative", "confirmed", "deposit_paid", "paid"]}
-    })
-    if conflict:
+    # interpret provided start_time as UTC (ISO assumed). Ensure it's within availability windows
+    start_utc = req.start_time if req.start_time.tzinfo else req.start_time.replace(tzinfo=ZoneInfo("UTC"))
+    end_utc = start_utc + timedelta(minutes=duration)
+
+    # Validate against availability engine
+    rules = load_availability_rules(req.organization_id)
+    tz = get_org_timezone(org)
+    start_local = start_utc.astimezone(tz)
+    day_local = start_local.date()
+
+    if is_blocked_day(day_local, rules, req.service_id):
+        raise HTTPException(status_code=409, detail="Selected day is unavailable")
+
+    windows_by_wd = build_daily_work_windows(org, rules, req.service_id)
+    weekday = day_local.weekday()
+    windows = windows_by_wd.get(weekday, [])
+    within_window = False
+    for st_t, en_t in windows:
+        win_start = datetime.combine(day_local, st_t).replace(tzinfo=tz)
+        win_end = datetime.combine(day_local, en_t).replace(tzinfo=tz)
+        if start_local >= win_start and (start_local + timedelta(minutes=duration)) <= win_end:
+            within_window = True
+            break
+    if not within_window:
+        raise HTTPException(status_code=409, detail="Selected time outside working hours")
+
+    # check appointment conflicts
+    if existing_conflict(req.organization_id, start_utc, end_utc):
         raise HTTPException(status_code=409, detail="Time slot unavailable")
 
     # generate public code
@@ -91,8 +274,8 @@ def public_book(req: CreateAppointmentRequest):
         customer_name=req.customer_name,
         customer_email=req.customer_email,
         customer_phone=req.customer_phone,
-        start_time=start,
-        end_time=end,
+        start_time=start_utc,
+        end_time=end_utc,
         status="tentative",
         notes=req.notes,
         public_code=public_code
@@ -119,19 +302,35 @@ def public_modify(req: ModifyAppointmentRequest):
         return {"status": "cancelled"}
     if req.start_time:
         svc = db["servicetype"].find_one({"_id": to_object_id(appt["service_id"])})
+        org = db["organization"].find_one({"_id": to_object_id(appt["organization_id"])})
         duration = int(svc.get("duration_minutes", 60))
-        start = req.start_time
-        end = start + timedelta(minutes=duration)
-        conflict = db["appointment"].find_one({
-            "_id": {"$ne": appt["_id"]},
-            "organization_id": appt["organization_id"],
-            "start_time": {"$lt": end},
-            "end_time": {"$gt": start},
-            "status": {"$in": ["tentative", "confirmed", "deposit_paid", "paid"]}
-        })
+        start_utc = req.start_time if req.start_time.tzinfo else req.start_time.replace(tzinfo=ZoneInfo("UTC"))
+        end_utc = start_utc + timedelta(minutes=duration)
+
+        # availability validation
+        rules = load_availability_rules(appt["organization_id"]) 
+        tz = get_org_timezone(org)
+        start_local = start_utc.astimezone(tz)
+        day_local = start_local.date()
+        if is_blocked_day(day_local, rules, appt["service_id"]):
+            raise HTTPException(status_code=409, detail="Selected day is unavailable")
+        windows_by_wd = build_daily_work_windows(org, rules, appt["service_id"]) 
+        weekday = day_local.weekday()
+        windows = windows_by_wd.get(weekday, [])
+        within_window = False
+        for st_t, en_t in windows:
+            win_start = datetime.combine(day_local, st_t).replace(tzinfo=tz)
+            win_end = datetime.combine(day_local, en_t).replace(tzinfo=tz)
+            if start_local >= win_start and (start_local + timedelta(minutes=duration)) <= win_end:
+                within_window = True
+                break
+        if not within_window:
+            raise HTTPException(status_code=409, detail="Selected time outside working hours")
+
+        conflict = existing_conflict(appt["organization_id"], start_utc, end_utc, exclude_appt_id=appt["_id"]) 
         if conflict:
             raise HTTPException(status_code=409, detail="Time slot unavailable")
-        db["appointment"].update_one({"_id": appt["_id"]}, {"$set": {"start_time": start, "end_time": end, "updated_at": datetime.utcnow()}})
+        db["appointment"].update_one({"_id": appt["_id"]}, {"$set": {"start_time": start_utc, "end_time": end_utc, "updated_at": datetime.utcnow()}})
     return {"status": "updated"}
 
 
